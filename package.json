@@ -1,6 +1,6 @@
 {
   "name": "@unconfirmed/bcs",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "sideEffects": false,
   "description": "High-performance BCS (Binary Canonical Serialization) for TypeScript — powered by bcs-zig WASM. Drop-in replacement for @mysten/bcs.",
   "type": "module",
@@ -13,6 +13,13 @@
       "import": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
+      }
+    },
+    "./raw": {
+      "bun": "./src/raw.ts",
+      "import": {
+        "types": "./dist/raw.d.ts",
+        "default": "./dist/raw.js"
       }
     }
   },
