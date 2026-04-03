@@ -136,6 +136,33 @@ function bigintExpr(vExpr: string): string {
 	return `(typeof ${vExpr}==='bigint'?${vExpr}:BigInt(${vExpr}))`;
 }
 
+// Check if a type tree needs DataView (has u16+ integer fields)
+function needsDataView(info: TypeInfo): boolean {
+	switch (info.kind) {
+		case "u16":
+		case "u32":
+		case "u64":
+		case "u128":
+		case "u256":
+			return true;
+
+		case "struct":
+			return info.fields!.some((f) => needsDataView(f.type));
+		case "fixedArray":
+			return needsDataView(info.elementType!);
+		case "vector":
+			return needsDataView(info.elementType!);
+		case "option":
+			return needsDataView(info.innerType!);
+		case "enum":
+			return info.variantTypes!.some(
+				(v) => v.type != null && needsDataView(v.type),
+			);
+		default:
+			return false;
+	}
+}
+
 function genSer(info: TypeInfo, v: string, L: string[]): void {
 	switch (info.kind) {
 		case "bool":
@@ -399,18 +426,27 @@ export function getCompiledSerializer(
 	_vc = 0;
 	const L: string[] = [];
 
+	const hasBigInt = needsDataView(info);
 	if (info.fixedSize != null) {
-		// Fixed-size: allocate exact buffer directly (no shared buf + slice)
-		L.push(
-			`var b=new ArrayBuffer(${info.fixedSize}),w=new DataView(b),a=new Uint8Array(b),o=0;`,
-		);
+		// Fixed-size: allocate exact buffer directly
+		if (hasBigInt) {
+			L.push(
+				`var b=new ArrayBuffer(${info.fixedSize}),w=new DataView(b),a=new Uint8Array(b),o=0;`,
+			);
+		} else {
+			L.push(`var a=new Uint8Array(${info.fixedSize}),o=0;`);
+		}
 		genSer(info, "v", L);
 		L.push(`return a;`);
 	} else {
-		// Variable-size: growable buffer + slice at end
-		// Grow function ensures capacity, re-creates views
-		L.push(`var sz=1024,b=new ArrayBuffer(sz),w=new DataView(b),a=new Uint8Array(b),o=0;`);
-		L.push(`function G(n){while(sz<n)sz*=2;var nb=new ArrayBuffer(sz);new Uint8Array(nb).set(a);b=nb;w=new DataView(b);a=new Uint8Array(b);}`);
+		// Variable-size: growable buffer
+		if (hasBigInt) {
+			L.push(`var sz=1024,b=new ArrayBuffer(sz),w=new DataView(b),a=new Uint8Array(b),o=0;`);
+			L.push(`function G(n){while(sz<n)sz*=2;var nb=new ArrayBuffer(sz);new Uint8Array(nb).set(a);b=nb;w=new DataView(b);a=new Uint8Array(b);}`);
+		} else {
+			L.push(`var sz=1024,a=new Uint8Array(sz),o=0;`);
+			L.push(`function G(n){while(sz<n)sz*=2;var na=new Uint8Array(sz);na.set(a);a=na;}`);
+		}
 		genSer(info, "v", L);
 		L.push(`return a.slice(0,o);`);
 	}
@@ -438,8 +474,12 @@ export function getCompiledSerializeInto(
 
 	_vc = 0;
 	const L: string[] = [];
-	// Write directly into caller's buffer — zero allocation
-	L.push(`var w=new DataView(a.buffer,a.byteOffset,a.byteLength),o=off;`);
+	const hasBigInt = needsDataView(info);
+	if (hasBigInt) {
+		L.push(`var w=new DataView(a.buffer,a.byteOffset,a.byteLength),o=off;`);
+	} else {
+		L.push(`var o=off;`);
+	}
 	genSer(info, "v", L);
 	L.push(`return o;`);
 
@@ -469,9 +509,12 @@ export function getCompiledDeserializer(
 
 	_vc = 0;
 	const L: string[] = [];
-	L.push(
-		`var D=new DataView(d.buffer,d.byteOffset,d.byteLength),o=0;`,
-	);
+	const hasBigInt = needsDataView(info);
+	if (hasBigInt) {
+		L.push(`var D=new DataView(d.buffer,d.byteOffset,d.byteLength),o=0;`);
+	} else {
+		L.push(`var o=0;`);
+	}
 	const rid = genDe(info, L);
 	L.push(`return ${rid};`);
 
