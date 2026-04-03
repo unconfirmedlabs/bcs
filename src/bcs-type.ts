@@ -79,6 +79,16 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 
 	serialize(value: Input, options?: BcsWriterOptions) {
 		this.validate(value);
+		// Check compiled serializer at the top level
+		// Safe for non-transforms and option transforms (codegen handles null natively)
+		if (!options && (!this.#isTransformed || (this as any)._optionInner)) {
+			if (this.#compiledSerializer === undefined) {
+				this.#compiledSerializer = getCompiledSerializer(this);
+			}
+			if (this.#compiledSerializer) {
+				return new SerializedBcs(this, this.#compiledSerializer(value));
+			}
+		}
 		return new SerializedBcs(this, this.#serialize(value, options));
 	}
 
@@ -135,6 +145,8 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 		input?: (val: Input2) => Input;
 		output?: (value: T) => T2;
 	} & BcsTypeOptions<T2, Input2, NewName>) {
+		// Capture reference to this type's compiled serializer check
+		const innerSerialize = this.#serialize.bind(this);
 		const transformed = new BcsType<T2, Input2, NewName>({
 			name: (name ?? this.name) as NewName,
 			read: (reader) =>
@@ -144,7 +156,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 			serializedSize: (value) =>
 				this.serializedSize(input ? input(value) : (value as never)),
 			serialize: (value, options) =>
-				this.#serialize(input ? input(value) : (value as never), options),
+				innerSerialize(input ? input(value) : (value as never), options),
 			validate: (value) => {
 				validate?.(value);
 				this.validate(input ? input(value) : (value as never));
