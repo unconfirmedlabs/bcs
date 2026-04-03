@@ -1,0 +1,25 @@
+{
+  "name": "@unconfirmed/bcs",
+  "version": "0.1.0",
+  "description": "High-performance BCS (Binary Canonical Serialization) for TypeScript — powered by bcs-zig WASM. Drop-in replacement for @mysten/bcs.",
+  "module": "src/index.ts",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "src",
+    "wasm/bcs.wasm"
+  ],
+  "scripts": {
+    "build:wasm": "bash wasm/build.sh",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
