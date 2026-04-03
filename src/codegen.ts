@@ -152,15 +152,29 @@ function bigintExpr(vExpr: string): string {
 	return `(typeof ${vExpr}==='bigint'?${vExpr}:BigInt(${vExpr}))`;
 }
 
-// Check if a type tree needs DataView (has u16+ integer fields)
+// Check if a type tree needs DataView for SERIALIZE (only bulk u32 vectors)
+function needsDataViewSerialize(info: TypeInfo): boolean {
+	switch (info.kind) {
+		case "vector":
+			if (info.elementType!.kind === "u32" || info.elementType!.kind === "u16")
+				return true;
+			return needsDataViewSerialize(info.elementType!);
+		case "struct":
+			return info.fields!.some((f) => needsDataViewSerialize(f.type));
+		case "fixedArray":
+			return needsDataViewSerialize(info.elementType!);
+		case "option":
+			return needsDataViewSerialize(info.innerType!);
+		case "enum":
+			return info.variantTypes!.some((v) => v.type != null && needsDataViewSerialize(v.type));
+		default:
+			return false;
+	}
+}
+
+// Check if a type tree needs DataView for DESERIALIZE
 function needsDataView(info: TypeInfo): boolean {
 	switch (info.kind) {
-		case "u16":
-		case "u32":
-		case "u64":
-		case "u128":
-		case "u256":
-			return true;
 
 		case "struct":
 			return info.fields!.some((f) => needsDataView(f.type));
@@ -188,26 +202,42 @@ function genSer(info: TypeInfo, v: string, L: string[]): void {
 			L.push(`a[o++]=${v};`);
 			break;
 		case "u16":
-			L.push(`w.setUint16(o,${v},true);o+=2;`);
+			L.push(`a[o++]=${v}&0xFF;a[o++]=(${v}>>8)&0xFF;`);
 			break;
-		case "u32":
-			L.push(`w.setUint32(o,${v},true);o+=4;`);
+		case "u32": {
+			const t = nv();
+			L.push(`var ${t}=${v};a[o++]=${t}&0xFF;a[o++]=(${t}>>8)&0xFF;a[o++]=(${t}>>16)&0xFF;a[o++]=(${t}>>24)&0xFF;`);
 			break;
-		case "u64":
-			L.push(`w.setBigUint64(o,${bigintExpr(v)},true);o+=8;`);
+		}
+		case "u64": {
+			const b = nv();
+			const lo = nv();
+			const hi = nv();
+			L.push(`var ${b}=${bigintExpr(v)},${lo}=Number(${b}&0xFFFFFFFFn),${hi}=Number(${b}>>32n&0xFFFFFFFFn);`);
+			L.push(`a[o++]=${lo}&0xFF;a[o++]=(${lo}>>8)&0xFF;a[o++]=(${lo}>>16)&0xFF;a[o++]=(${lo}>>24)&0xFF;`);
+			L.push(`a[o++]=${hi}&0xFF;a[o++]=(${hi}>>8)&0xFF;a[o++]=(${hi}>>16)&0xFF;a[o++]=(${hi}>>24)&0xFF;`);
 			break;
+		}
 		case "u128": {
 			const b = nv();
-			L.push(
-				`var ${b}=${bigintExpr(v)};w.setBigUint64(o,${b}&0xFFFFFFFFFFFFFFFFn,true);w.setBigUint64(o+8,${b}>>64n,true);o+=16;`,
-			);
+			L.push(`var ${b}=${bigintExpr(v)};`);
+			// Write as 4 u32 chunks
+			for (let chunk = 0; chunk < 4; chunk++) {
+				const c = nv();
+				L.push(`var ${c}=Number(${b}>>${chunk * 32}n&0xFFFFFFFFn);`);
+				L.push(`a[o++]=${c}&0xFF;a[o++]=(${c}>>8)&0xFF;a[o++]=(${c}>>16)&0xFF;a[o++]=(${c}>>24)&0xFF;`);
+			}
 			break;
 		}
 		case "u256": {
 			const b = nv();
-			L.push(
-				`var ${b}=${bigintExpr(v)},M=0xFFFFFFFFFFFFFFFFn;w.setBigUint64(o,${b}&M,true);w.setBigUint64(o+8,(${b}>>64n)&M,true);w.setBigUint64(o+16,(${b}>>128n)&M,true);w.setBigUint64(o+24,${b}>>192n,true);o+=32;`,
-			);
+			L.push(`var ${b}=${bigintExpr(v)};`);
+			// Write as 8 u32 chunks
+			for (let chunk = 0; chunk < 8; chunk++) {
+				const c = nv();
+				L.push(`var ${c}=Number(${b}>>${chunk * 32}n&0xFFFFFFFFn);`);
+				L.push(`a[o++]=${c}&0xFF;a[o++]=(${c}>>8)&0xFF;a[o++]=(${c}>>16)&0xFF;a[o++]=(${c}>>24)&0xFF;`);
+			}
 			break;
 		}
 		case "bytes":
@@ -304,26 +334,48 @@ function genDe(info: TypeInfo, L: string[]): string {
 			L.push(`var ${id}=d[o++];`);
 			return id;
 		case "u16":
-			L.push(`var ${id}=D.getUint16(o,true);o+=2;`);
+			L.push(`var ${id}=d[o]|d[o+1]<<8;o+=2;`);
 			return id;
 		case "u32":
-			L.push(`var ${id}=D.getUint32(o,true);o+=4;`);
+			L.push(`var ${id}=(d[o]|d[o+1]<<8|d[o+2]<<16|d[o+3]<<24)>>>0;o+=4;`);
 			return id;
-		case "u64":
-			L.push(
-				`var ${id}=D.getBigUint64(o,true).toString(10);o+=8;`,
-			);
+		case "u64": {
+			// Read as two u32 from bytes, construct BigInt — avoids DataView
+			const lo = nv();
+			const hi = nv();
+			L.push(`var ${lo}=(d[o]|d[o+1]<<8|d[o+2]<<16|d[o+3]<<24)>>>0,${hi}=(d[o+4]|d[o+5]<<8|d[o+6]<<16|d[o+7]<<24)>>>0;`);
+			L.push(`var ${id}=(BigInt(${hi})*0x100000000n+BigInt(${lo})).toString(10);o+=8;`);
 			return id;
-		case "u128":
-			L.push(
-				`var ${id}=((D.getBigUint64(o+8,true)<<64n)|D.getBigUint64(o,true)).toString(10);o+=16;`,
-			);
+		}
+		case "u128": {
+			// Read as four u32 from bytes
+			const parts: string[] = [];
+			for (let chunk = 0; chunk < 4; chunk++) {
+				const p = nv();
+				const off = chunk * 4;
+				L.push(`var ${p}=(d[o+${off}]|d[o+${off+1}]<<8|d[o+${off+2}]<<16|d[o+${off+3}]<<24)>>>0;`);
+				parts.push(p);
+			}
+			L.push(`var ${id}=(BigInt(${parts[3]})*0x1000000000000000000000000n+BigInt(${parts[2]})*0x10000000000000000n+BigInt(${parts[1]})*0x100000000n+BigInt(${parts[0]})).toString(10);o+=16;`);
 			return id;
-		case "u256":
-			L.push(
-				`var ${id}=((D.getBigUint64(o+24,true)<<192n)|(D.getBigUint64(o+16,true)<<128n)|(D.getBigUint64(o+8,true)<<64n)|D.getBigUint64(o,true)).toString(10);o+=32;`,
-			);
+		}
+		case "u256": {
+			// Read as eight u32 from bytes
+			const parts: string[] = [];
+			for (let chunk = 0; chunk < 8; chunk++) {
+				const p = nv();
+				const off = chunk * 4;
+				L.push(`var ${p}=(d[o+${off}]|d[o+${off+1}]<<8|d[o+${off+2}]<<16|d[o+${off+3}]<<24)>>>0;`);
+				parts.push(p);
+			}
+			L.push(`var ${id}=(`);
+			for (let i = 7; i >= 0; i--) {
+				if (i < 7) L.push(`+`);
+				L.push(`BigInt(${parts[i]})${i > 0 ? `*0x${(1n << BigInt(i * 32)).toString(16)}n` : ""}`);
+			}
+			L.push(`).toString(10);o+=32;`);
 			return id;
+		}
 		case "bytes":
 			L.push(`var ${id}=d.slice(o,o+${info.size});o+=${info.size};`);
 			return id;
@@ -444,25 +496,17 @@ export function getCompiledSerializer(
 	_vc = 0;
 	const L: string[] = [];
 
-	const hasBigInt = needsDataView(info);
+	const needsDV = needsDataViewSerialize(info);
 	if (info.fixedSize != null) {
-		// Fixed-size: allocate exact buffer directly
-		if (hasBigInt) {
-			L.push(
-				`var b=new ArrayBuffer(${info.fixedSize}),w=new DataView(b),a=new Uint8Array(b),o=0;`,
-			);
-		} else {
-			L.push(`var a=new Uint8Array(${info.fixedSize}),o=0;`);
-		}
+		// Fixed-size: allocate exact buffer directly — no DataView needed
+		L.push(`var a=new Uint8Array(${info.fixedSize}),o=0;`);
+		if (needsDV) L.push(`var w=new DataView(a.buffer);`);
 		genSer(info, "v", L);
 		L.push(`return a;`);
 	} else {
 		// Variable-size: use shared buffer (no per-call alloc), slice at end
-		if (hasBigInt) {
-			L.push(`E.shEnsure(1024);var w=E.shDv,a=E.shArr,o=0;`);
-		} else {
-			L.push(`E.shEnsure(1024);var a=E.shArr,o=0;`);
-		}
+		L.push(`E.shEnsure(1024);var a=E.shArr,o=0;`);
+		if (needsDV) L.push(`var w=E.shDv;`);
 		genSer(info, "v", L);
 		L.push(`return a.slice(0,o);`);
 	}
@@ -490,12 +534,9 @@ export function getCompiledSerializeInto(
 
 	_vc = 0;
 	const L: string[] = [];
-	const hasBigInt = needsDataView(info);
-	if (hasBigInt) {
-		L.push(`var w=new DataView(a.buffer,a.byteOffset,a.byteLength),o=off;`);
-	} else {
-		L.push(`var o=off;`);
-	}
+	const needsDV = needsDataViewSerialize(info);
+	L.push(`var o=off;`);
+	if (needsDV) L.push(`var w=new DataView(a.buffer,a.byteOffset,a.byteLength);`);
 	genSer(info, "v", L);
 	L.push(`return o;`);
 
