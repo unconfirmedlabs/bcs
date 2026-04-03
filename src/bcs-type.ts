@@ -82,7 +82,9 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 	}
 
 	parse(bytes: Uint8Array): T {
-		if (!this.#isTransformed) {
+		// Skip compiled deserializer for custom transforms (output fn is opaque)
+		// but allow option transforms (codegen handles them natively)
+		if (!this.#isTransformed || (this as any)._optionInner) {
 			if (this.#compiledDeserializer === undefined) {
 				this.#compiledDeserializer = getCompiledDeserializer(this);
 			}

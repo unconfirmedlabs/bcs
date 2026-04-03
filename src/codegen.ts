@@ -301,11 +301,13 @@ function genDeserialize(info: TypeInfo, lines: string[]): string {
 		case "bytes":
 			lines.push(`var ${id}=d.slice(o,o+${info.size});o+=${info.size};`);
 			return id;
-		case "fixedArrayU8":
+		case "fixedArrayU8": {
+			const j = nextVar();
 			lines.push(
-				`var ${id}=Array.from(d.subarray(o,o+${info.size}));o+=${info.size};`,
+				`var ${id}=new Array(${info.size});for(var ${j}=0;${j}<${info.size};${j}++)${id}[${j}]=d[o+${j}];o+=${info.size};`,
 			);
 			return id;
+		}
 		case "fixedArray": {
 			lines.push(`var ${id}=new Array(${info.size});`);
 			const i = nextVar();
