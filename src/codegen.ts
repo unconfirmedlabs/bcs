@@ -17,9 +17,25 @@ import type { BcsType } from "./bcs-type.js";
 const enc = new TextEncoder();
 const dec = new TextDecoder();
 
+// Shared buffer for variable-size serialize (avoids per-call allocation)
+let _shBuf = new ArrayBuffer(4096);
+let _shDv = new DataView(_shBuf);
+let _shArr = new Uint8Array(_shBuf);
+
+function _shEnsure(n: number) {
+	if (n <= _shBuf.byteLength) return;
+	const sz = Math.max(n, _shBuf.byteLength * 2);
+	_shBuf = new ArrayBuffer(sz);
+	_shDv = new DataView(_shBuf);
+	_shArr = new Uint8Array(_shBuf);
+}
+
 const _env = {
 	enc,
 	dec,
+	get shDv() { return _shDv; },
+	get shArr() { return _shArr; },
+	shEnsure: _shEnsure,
 };
 
 // ── Type analysis ────────────────────────────────────────────────────
@@ -210,6 +226,8 @@ function genSer(info: TypeInfo, v: string, L: string[]): void {
 		case "string": {
 			const sb = nv();
 			L.push(`var ${sb}=E.enc.encode(${v});`);
+			// Ensure shared buffer can fit the string
+			L.push(`{var _need=o+5+${sb}.length;if(_need>a.length){E.shEnsure(_need);a=E.shArr;if(typeof w!=='undefined')w=E.shDv;}}`);
 			// Inline ULEB write for string length
 			L.push(`var _sl=${sb}.length;`);
 			L.push(
@@ -222,14 +240,14 @@ function genSer(info: TypeInfo, v: string, L: string[]): void {
 			const ar = nv();
 			const i = nv();
 			L.push(`var ${ar}=Array.from(${v});`);
-			// Pre-grow buffer for known element sizes
+			// Pre-grow shared buffer for vectors
 			if (info.elementType!.fixedSize != null) {
 				L.push(
-					`if(typeof G==='function'){var _need=o+5+${ar}.length*${info.elementType!.fixedSize};if(_need>sz)G(_need);}`,
+					`{var _need=o+5+${ar}.length*${info.elementType!.fixedSize};E.shEnsure(_need);w=E.shDv;a=E.shArr;}`,
 				);
 			} else {
 				L.push(
-					`if(typeof G==='function'){var _need=o+5+${ar}.length*8;if(_need>sz)G(_need);}`,
+					`{var _need=o+5+${ar}.length*64;E.shEnsure(_need);a=E.shArr;if(typeof w!=='undefined')w=E.shDv;}`,
 				);
 			}
 			// Inline ULEB write for vector length
@@ -439,13 +457,11 @@ export function getCompiledSerializer(
 		genSer(info, "v", L);
 		L.push(`return a;`);
 	} else {
-		// Variable-size: growable buffer
+		// Variable-size: use shared buffer (no per-call alloc), slice at end
 		if (hasBigInt) {
-			L.push(`var sz=1024,b=new ArrayBuffer(sz),w=new DataView(b),a=new Uint8Array(b),o=0;`);
-			L.push(`function G(n){while(sz<n)sz*=2;var nb=new ArrayBuffer(sz);new Uint8Array(nb).set(a);b=nb;w=new DataView(b);a=new Uint8Array(b);}`);
+			L.push(`E.shEnsure(1024);var w=E.shDv,a=E.shArr,o=0;`);
 		} else {
-			L.push(`var sz=1024,a=new Uint8Array(sz),o=0;`);
-			L.push(`function G(n){while(sz<n)sz*=2;var na=new Uint8Array(sz);na.set(a);a=na;}`);
+			L.push(`E.shEnsure(1024);var a=E.shArr,o=0;`);
 		}
 		genSer(info, "v", L);
 		L.push(`return a.slice(0,o);`);
