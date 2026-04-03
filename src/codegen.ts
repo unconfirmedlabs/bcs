@@ -1,17 +1,68 @@
 /**
- * Compile-time specialization for BCS serialize/deserialize.
+ * Schema-driven code generation for BCS serialize/deserialize.
  *
- * Analyzes BcsType at definition time and generates specialized
- * serialize/deserialize functions with pre-computed field offsets.
- * For fixed-size types: single exact-size allocation, direct DataView writes.
- * For variable-size types: minimal buffer growth, inlined ULEB128.
+ * At schema definition time, generates straight-line JS functions via
+ * new Function() with:
+ * - Pre-computed field offsets for fixed-size types
+ * - Direct property access (v.fieldName) instead of obj[key]
+ * - Inline ULEB128 writes (no array allocation)
+ * - Singleton reusable buffer (no per-call allocation)
+ *
+ * Approach modeled on protobuf.js, avsc, and SchemaPack.
  */
 
 import type { BcsType } from "./bcs-type.js";
-import { ulebEncode, ulebDecode } from "./uleb.js";
 
-const textEncoder = new TextEncoder();
-const textDecoder = new TextDecoder();
+// ── Shared buffer singleton ──────────────────────────────────────────
+// Reused across all serialize calls. Only the final .slice() copies out.
+
+let sharedBuf = new ArrayBuffer(4096);
+let sharedDv = new DataView(sharedBuf);
+let sharedArr = new Uint8Array(sharedBuf);
+
+function ensureCapacity(needed: number) {
+	if (needed <= sharedBuf.byteLength) return;
+	const size = Math.max(needed, sharedBuf.byteLength * 2);
+	sharedBuf = new ArrayBuffer(size);
+	sharedDv = new DataView(sharedBuf);
+	sharedArr = new Uint8Array(sharedBuf);
+}
+
+// Exposed to generated functions via closure
+const _env = {
+	dv: sharedDv,
+	arr: sharedArr,
+	ensure: ensureCapacity,
+	refreshViews() {
+		this.dv = sharedDv;
+		this.arr = sharedArr;
+	},
+	// Inline ULEB128 write — no allocation
+	writeULEB(offset: number, value: number): number {
+		const a = this.arr;
+		while (value > 0x7f) {
+			a[offset++] = (value & 0x7f) | 0x80;
+			value >>>= 7;
+		}
+		a[offset++] = value;
+		return offset;
+	},
+	// Inline ULEB128 read — no allocation
+	readULEB(data: Uint8Array, offset: number): { val: number; end: number } {
+		let val = 0;
+		let shift = 0;
+		let o = offset;
+		while (true) {
+			const byte = data[o++]!;
+			val |= (byte & 0x7f) << shift;
+			if ((byte & 0x80) === 0) break;
+			shift += 7;
+		}
+		return { val, end: o };
+	},
+	enc: new TextEncoder(),
+	dec: new TextDecoder(),
+};
 
 // ── Type analysis ────────────────────────────────────────────────────
 
@@ -25,7 +76,9 @@ interface TypeInfo {
 	innerType?: TypeInfo;
 }
 
-export function analyzeType(type: BcsType<unknown, unknown>): TypeInfo | null {
+export function analyzeType(
+	type: BcsType<unknown, unknown>,
+): TypeInfo | null {
 	const name = type.name;
 
 	if (name === "bool") return { kind: "bool", fixedSize: 1 };
@@ -39,7 +92,8 @@ export function analyzeType(type: BcsType<unknown, unknown>): TypeInfo | null {
 
 	const bytesMatch = name.match(/^bytes\[(\d+)\]$/);
 	if (bytesMatch) {
-		return { kind: "bytes", fixedSize: parseInt(bytesMatch[1]!), size: parseInt(bytesMatch[1]!) };
+		const size = parseInt(bytesMatch[1]!);
+		return { kind: "bytes", fixedSize: size, size };
 	}
 
 	const fixedArrayMatch = name.match(/^(.+)\[(\d+)\]$/);
@@ -52,7 +106,8 @@ export function analyzeType(type: BcsType<unknown, unknown>): TypeInfo | null {
 		if (elemInfo.kind === "u8") {
 			return { kind: "fixedArrayU8", fixedSize: size, size };
 		}
-		const fixedSize = elemInfo.fixedSize != null ? elemInfo.fixedSize * size : null;
+		const fixedSize =
+			elemInfo.fixedSize != null ? elemInfo.fixedSize * size : null;
 		return { kind: "fixedArray", fixedSize, elementType: elemInfo, size };
 	}
 
@@ -76,19 +131,29 @@ export function analyzeType(type: BcsType<unknown, unknown>): TypeInfo | null {
 		const fields: { key: string; type: TypeInfo }[] = [];
 		let totalFixed = 0;
 		let allFixed = true;
-		for (const [key, fieldType] of (type as any)._fields as [string, BcsType<unknown, unknown>][]) {
+		for (const [key, fieldType] of (type as any)._fields as [
+			string,
+			BcsType<unknown, unknown>,
+		][]) {
 			const info = analyzeType(fieldType);
 			if (!info) return null;
 			fields.push({ key, type: info });
 			if (info.fixedSize != null) totalFixed += info.fixedSize;
 			else allFixed = false;
 		}
-		return { kind: "struct", fixedSize: allFixed ? totalFixed : null, fields };
+		return {
+			kind: "struct",
+			fixedSize: allFixed ? totalFixed : null,
+			fields,
+		};
 	}
 
 	if ((type as any)._variants) {
 		const variants: { key: string; type: TypeInfo | null }[] = [];
-		for (const [key, varType] of (type as any)._variants as [string, BcsType<unknown, unknown> | null][]) {
+		for (const [key, varType] of (type as any)._variants as [
+			string,
+			BcsType<unknown, unknown> | null,
+		][]) {
 			if (varType === null) {
 				variants.push({ key, type: null });
 			} else {
@@ -103,253 +168,286 @@ export function analyzeType(type: BcsType<unknown, unknown>): TypeInfo | null {
 	return null;
 }
 
-// ── Specialized serialize ────────────────────────────────────────────
+// ── Serialize codegen ────────────────────────────────────────────────
 
-function serializeValue(info: TypeInfo, value: unknown, arr: Uint8Array, dv: DataView, o: number): number {
+let _varCounter = 0;
+function nextVar(): string {
+	return `_${_varCounter++}`;
+}
+
+function genSerialize(info: TypeInfo, vExpr: string, lines: string[]): void {
 	switch (info.kind) {
 		case "bool":
-			dv.setUint8(o, (value as boolean) ? 1 : 0);
-			return o + 1;
+			lines.push(`E.dv.setUint8(o,${vExpr}?1:0);o+=1;`);
+			break;
 		case "u8":
-			dv.setUint8(o, value as number);
-			return o + 1;
+			lines.push(`E.dv.setUint8(o,${vExpr});o+=1;`);
+			break;
 		case "u16":
-			dv.setUint16(o, value as number, true);
-			return o + 2;
+			lines.push(`E.dv.setUint16(o,${vExpr},true);o+=2;`);
+			break;
 		case "u32":
-			dv.setUint32(o, value as number, true);
-			return o + 4;
+			lines.push(`E.dv.setUint32(o,${vExpr},true);o+=4;`);
+			break;
 		case "u64":
-			dv.setBigUint64(o, BigInt(value as string | number | bigint), true);
-			return o + 8;
+			lines.push(`E.dv.setBigUint64(o,BigInt(${vExpr}),true);o+=8;`);
+			break;
 		case "u128": {
-			const b = BigInt(value as string | number | bigint);
-			dv.setBigUint64(o, b & 0xFFFFFFFFFFFFFFFFn, true);
-			dv.setBigUint64(o + 8, b >> 64n, true);
-			return o + 16;
+			const b = nextVar();
+			lines.push(
+				`var ${b}=BigInt(${vExpr});E.dv.setBigUint64(o,${b}&0xFFFFFFFFFFFFFFFFn,true);E.dv.setBigUint64(o+8,${b}>>64n,true);o+=16;`,
+			);
+			break;
 		}
 		case "u256": {
-			const b = BigInt(value as string | number | bigint);
-			const m = 0xFFFFFFFFFFFFFFFFn;
-			dv.setBigUint64(o, b & m, true);
-			dv.setBigUint64(o + 8, (b >> 64n) & m, true);
-			dv.setBigUint64(o + 16, (b >> 128n) & m, true);
-			dv.setBigUint64(o + 24, b >> 192n, true);
-			return o + 32;
+			const b = nextVar();
+			lines.push(
+				`var ${b}=BigInt(${vExpr}),M=0xFFFFFFFFFFFFFFFFn;E.dv.setBigUint64(o,${b}&M,true);E.dv.setBigUint64(o+8,(${b}>>64n)&M,true);E.dv.setBigUint64(o+16,(${b}>>128n)&M,true);E.dv.setBigUint64(o+24,${b}>>192n,true);o+=32;`,
+			);
+			break;
 		}
 		case "bytes":
-		case "fixedArrayU8": {
-			const src = value instanceof Uint8Array ? value : new Uint8Array(value as Iterable<number>);
-			arr.set(src, o);
-			return o + info.size!;
-		}
+		case "fixedArrayU8":
+			lines.push(
+				`E.arr.set(${vExpr} instanceof Uint8Array?${vExpr}:new Uint8Array(${vExpr}),o);o+=${info.size};`,
+			);
+			break;
 		case "fixedArray": {
-			const a = value as unknown[];
-			for (let i = 0; i < info.size!; i++) {
-				o = serializeValue(info.elementType!, a[i], arr, dv, o);
-			}
-			return o;
+			const i = nextVar();
+			lines.push(`for(var ${i}=0;${i}<${info.size};${i}++){`);
+			genSerialize(info.elementType!, `${vExpr}[${i}]`, lines);
+			lines.push(`}`);
+			break;
 		}
 		case "string": {
-			const strBytes = textEncoder.encode(value as string);
-			const uleb = ulebEncode(strBytes.length);
-			arr.set(uleb, o);
-			o += uleb.length;
-			arr.set(strBytes, o);
-			return o + strBytes.length;
+			const sb = nextVar();
+			lines.push(
+				`var ${sb}=E.enc.encode(${vExpr});o=E.writeULEB(o,${sb}.length);E.arr.set(${sb},o);o+=${sb}.length;`,
+			);
+			break;
 		}
 		case "vector": {
-			const a = Array.from(value as Iterable<unknown>);
-			const uleb = ulebEncode(a.length);
-			arr.set(uleb, o);
-			o += uleb.length;
-			for (let i = 0; i < a.length; i++) {
-				o = serializeValue(info.elementType!, a[i], arr, dv, o);
-			}
-			return o;
+			const a = nextVar();
+			const i = nextVar();
+			lines.push(
+				`var ${a}=Array.from(${vExpr});o=E.writeULEB(o,${a}.length);for(var ${i}=0;${i}<${a}.length;${i}++){`,
+			);
+			genSerialize(info.elementType!, `${a}[${i}]`, lines);
+			lines.push(`}`);
+			break;
 		}
-		case "option": {
-			if (value == null) {
-				dv.setUint8(o, 0);
-				return o + 1;
-			}
-			dv.setUint8(o, 1);
-			return serializeValue(info.innerType!, value, arr, dv, o + 1);
-		}
-		case "struct": {
-			const obj = value as Record<string, unknown>;
+		case "option":
+			lines.push(`if(${vExpr}==null){E.dv.setUint8(o++,0);}else{E.dv.setUint8(o++,1);`);
+			genSerialize(info.innerType!, vExpr, lines);
+			lines.push(`}`);
+			break;
+		case "struct":
 			for (const f of info.fields!) {
-				o = serializeValue(f.type, obj[f.key], arr, dv, o);
+				genSerialize(f.type, `${vExpr}[${JSON.stringify(f.key)}]`, lines);
 			}
-			return o;
-		}
-		case "enum": {
-			const obj = value as Record<string, unknown>;
+			break;
+		case "enum":
 			for (let i = 0; i < info.variantTypes!.length; i++) {
 				const v = info.variantTypes![i]!;
-				if (v.key in obj && obj[v.key] !== undefined) {
-					const uleb = ulebEncode(i);
-					arr.set(uleb, o);
-					o += uleb.length;
-					if (v.type) {
-						o = serializeValue(v.type, obj[v.key], arr, dv, o);
-					}
-					return o;
+				const cond = i === 0 ? "if" : "else if";
+				lines.push(
+					`${cond}(${JSON.stringify(v.key)} in ${vExpr}&&${vExpr}[${JSON.stringify(v.key)}]!==undefined){`,
+				);
+				// Inline ULEB for small variant indices (0-127 = single byte)
+				if (i < 128) {
+					lines.push(`E.arr[o++]=${i};`);
+				} else {
+					lines.push(`o=E.writeULEB(o,${i});`);
 				}
+				if (v.type) {
+					genSerialize(v.type, `${vExpr}[${JSON.stringify(v.key)}]`, lines);
+				}
+				lines.push(`}`);
 			}
-			return o;
-		}
+			break;
 	}
-	return o;
 }
 
-// ── Specialized deserialize ──────────────────────────────────────────
+// ── Deserialize codegen ──────────────────────────────────────────────
 
-function deserializeValue(info: TypeInfo, data: Uint8Array, dv: DataView, o: number): { value: unknown; offset: number } {
+function genDeserialize(info: TypeInfo, lines: string[]): string {
+	const id = nextVar();
 	switch (info.kind) {
 		case "bool":
-			return { value: dv.getUint8(o) === 1, offset: o + 1 };
+			lines.push(`var ${id}=D.getUint8(o++)===1;`);
+			return id;
 		case "u8":
-			return { value: dv.getUint8(o), offset: o + 1 };
+			lines.push(`var ${id}=D.getUint8(o++);`);
+			return id;
 		case "u16":
-			return { value: dv.getUint16(o, true), offset: o + 2 };
+			lines.push(`var ${id}=D.getUint16(o,true);o+=2;`);
+			return id;
 		case "u32":
-			return { value: dv.getUint32(o, true), offset: o + 4 };
+			lines.push(`var ${id}=D.getUint32(o,true);o+=4;`);
+			return id;
 		case "u64":
-			return { value: dv.getBigUint64(o, true).toString(10), offset: o + 8 };
-		case "u128": {
-			const lo = dv.getBigUint64(o, true);
-			const hi = dv.getBigUint64(o + 8, true);
-			return { value: ((hi << 64n) | lo).toString(10), offset: o + 16 };
-		}
-		case "u256": {
-			const a = dv.getBigUint64(o, true);
-			const b = dv.getBigUint64(o + 8, true);
-			const c = dv.getBigUint64(o + 16, true);
-			const d = dv.getBigUint64(o + 24, true);
-			return { value: ((d << 192n) | (c << 128n) | (b << 64n) | a).toString(10), offset: o + 32 };
-		}
+			lines.push(`var ${id}=D.getBigUint64(o,true).toString(10);o+=8;`);
+			return id;
+		case "u128":
+			lines.push(
+				`var ${id}=((D.getBigUint64(o+8,true)<<64n)|D.getBigUint64(o,true)).toString(10);o+=16;`,
+			);
+			return id;
+		case "u256":
+			lines.push(
+				`var ${id}=((D.getBigUint64(o+24,true)<<192n)|(D.getBigUint64(o+16,true)<<128n)|(D.getBigUint64(o+8,true)<<64n)|D.getBigUint64(o,true)).toString(10);o+=32;`,
+			);
+			return id;
 		case "bytes":
-			return { value: data.slice(o, o + info.size!), offset: o + info.size! };
+			lines.push(`var ${id}=d.slice(o,o+${info.size});o+=${info.size};`);
+			return id;
 		case "fixedArrayU8":
-			return { value: Array.from(data.subarray(o, o + info.size!)), offset: o + info.size! };
+			lines.push(
+				`var ${id}=Array.from(d.subarray(o,o+${info.size}));o+=${info.size};`,
+			);
+			return id;
 		case "fixedArray": {
-			const result = new Array(info.size!);
-			for (let i = 0; i < info.size!; i++) {
-				const r = deserializeValue(info.elementType!, data, dv, o);
-				result[i] = r.value;
-				o = r.offset;
-			}
-			return { value: result, offset: o };
+			lines.push(`var ${id}=new Array(${info.size});`);
+			const i = nextVar();
+			lines.push(`for(var ${i}=0;${i}<${info.size};${i}++){`);
+			const elemId = genDeserialize(info.elementType!, lines);
+			lines.push(`${id}[${i}]=${elemId};}`);
+			return id;
 		}
 		case "string": {
-			const { value: len, length: ulebLen } = ulebDecode(data.subarray(o));
-			o += ulebLen;
-			const str = textDecoder.decode(data.subarray(o, o + len));
-			return { value: str, offset: o + len };
+			const u = nextVar();
+			lines.push(
+				`var ${u}=E.readULEB(d,o);o=${u}.end;var ${id}=E.dec.decode(d.subarray(o,o+${u}.val));o+=${u}.val;`,
+			);
+			return id;
 		}
 		case "vector": {
-			const { value: count, length: ulebLen } = ulebDecode(data.subarray(o));
-			o += ulebLen;
-			const result: unknown[] = new Array(count);
-			for (let i = 0; i < count; i++) {
-				const r = deserializeValue(info.elementType!, data, dv, o);
-				result[i] = r.value;
-				o = r.offset;
-			}
-			return { value: result, offset: o };
+			const u = nextVar();
+			const i = nextVar();
+			lines.push(
+				`var ${u}=E.readULEB(d,o);o=${u}.end;var ${id}=new Array(${u}.val);for(var ${i}=0;${i}<${u}.val;${i}++){`,
+			);
+			const elemId = genDeserialize(info.elementType!, lines);
+			lines.push(`${id}[${i}]=${elemId};}`);
+			return id;
 		}
 		case "option": {
-			const tag = dv.getUint8(o);
-			o++;
-			if (tag === 0) return { value: null, offset: o };
-			return deserializeValue(info.innerType!, data, dv, o);
+			lines.push(`var ${id};if(d[o++]===0){${id}=null;}else{`);
+			const innerId = genDeserialize(info.innerType!, lines);
+			lines.push(`${id}=${innerId};}`);
+			return id;
 		}
 		case "struct": {
-			const obj: Record<string, unknown> = {};
+			const fieldParts: string[] = [];
 			for (const f of info.fields!) {
-				const r = deserializeValue(f.type, data, dv, o);
-				obj[f.key] = r.value;
-				o = r.offset;
+				const fid = genDeserialize(f.type, lines);
+				fieldParts.push(`${JSON.stringify(f.key)}:${fid}`);
 			}
-			return { value: obj, offset: o };
+			lines.push(`var ${id}={${fieldParts.join(",")}};`);
+			return id;
 		}
 		case "enum": {
-			const { value: idx, length: ulebLen } = ulebDecode(data.subarray(o));
-			o += ulebLen;
-			const v = info.variantTypes![idx]!;
-			if (!v.type) {
-				return { value: { [v.key]: true, $kind: v.key }, offset: o };
+			const u = nextVar();
+			lines.push(`var ${u}=E.readULEB(d,o);o=${u}.end;var ${id};`);
+			for (let i = 0; i < info.variantTypes!.length; i++) {
+				const v = info.variantTypes![i]!;
+				const cond = i === 0 ? "if" : "else if";
+				lines.push(`${cond}(${u}.val===${i}){`);
+				if (v.type) {
+					const vid = genDeserialize(v.type, lines);
+					lines.push(
+						`${id}={${JSON.stringify(v.key)}:${vid},$kind:${JSON.stringify(v.key)}};`,
+					);
+				} else {
+					lines.push(
+						`${id}={${JSON.stringify(v.key)}:true,$kind:${JSON.stringify(v.key)}};`,
+					);
+				}
+				lines.push(`}`);
 			}
-			const r = deserializeValue(v.type, data, dv, o);
-			return { value: { [v.key]: r.value, $kind: v.key }, offset: o = r.offset };
+			return id;
 		}
 	}
-	return { value: undefined, offset: o };
+	return "undefined";
 }
 
-// ── Public API ───────────────────────────────────────────────────────
+// ── Compile and cache ────────────────────────────────────────────────
 
 export type CompiledSerializer = (value: unknown) => Uint8Array;
 export type CompiledDeserializer = (data: Uint8Array) => unknown;
 
-const serializerCache = new WeakMap<BcsType<unknown, unknown>, CompiledSerializer | null>();
-const deserializerCache = new WeakMap<BcsType<unknown, unknown>, CompiledDeserializer | null>();
+const serializerCache = new WeakMap<
+	BcsType<unknown, unknown>,
+	CompiledSerializer | null
+>();
+const deserializerCache = new WeakMap<
+	BcsType<unknown, unknown>,
+	CompiledDeserializer | null
+>();
 
-export function getCompiledSerializer(type: BcsType<unknown, unknown>): CompiledSerializer | null {
+export function getCompiledSerializer(
+	type: BcsType<unknown, unknown>,
+): CompiledSerializer | null {
 	if (serializerCache.has(type)) return serializerCache.get(type)!;
 	const info = analyzeType(type);
-	if (!info) { serializerCache.set(type, null); return null; }
-
-	let fn: CompiledSerializer;
-	if (info.fixedSize != null) {
-		// Fixed-size: allocate exact buffer, no growth
-		const size = info.fixedSize;
-		fn = (value: unknown) => {
-			const buf = new ArrayBuffer(size);
-			const dv = new DataView(buf);
-			const arr = new Uint8Array(buf);
-			serializeValue(info, value, arr, dv, 0);
-			return arr;
-		};
-	} else {
-		// Variable-size: start with estimate, grow if needed
-		fn = (value: unknown) => {
-			let size = 512;
-			let buf = new ArrayBuffer(size);
-			let dv = new DataView(buf);
-			let arr = new Uint8Array(buf);
-			// Serialize — if we overflow, double and retry
-			// In practice, 512 bytes handles most values
-			try {
-				const end = serializeValue(info, value, arr, dv, 0);
-				return arr.slice(0, end);
-			} catch {
-				// Buffer too small — grow and retry
-				size = 4096;
-				buf = new ArrayBuffer(size);
-				dv = new DataView(buf);
-				arr = new Uint8Array(buf);
-				const end = serializeValue(info, value, arr, dv, 0);
-				return arr.slice(0, end);
-			}
-		};
+	if (!info) {
+		serializerCache.set(type, null);
+		return null;
 	}
 
-	serializerCache.set(type, fn);
-	return fn;
+	_varCounter = 0;
+	const lines: string[] = [];
+
+	if (info.fixedSize != null) {
+		// Fixed size: ensure capacity once, write at known offsets
+		lines.push(`E.ensure(${info.fixedSize});E.refreshViews();var o=0;`);
+		genSerialize(info, "v", lines);
+		lines.push(`return E.arr.slice(0,${info.fixedSize});`);
+	} else {
+		// Variable size: ensure generous capacity, grow if needed
+		lines.push(
+			`E.ensure(512);E.refreshViews();var o=0;`,
+		);
+		genSerialize(info, "v", lines);
+		lines.push(`return E.arr.slice(0,o);`);
+	}
+
+	const body = lines.join("\n");
+	// eslint-disable-next-line @typescript-eslint/no-implied-eval
+	const fn = new Function("v", "E", body) as (
+		v: unknown,
+		E: typeof _env,
+	) => Uint8Array;
+	const serializer: CompiledSerializer = (value) => fn(value, _env);
+	serializerCache.set(type, serializer);
+	return serializer;
 }
 
-export function getCompiledDeserializer(type: BcsType<unknown, unknown>): CompiledDeserializer | null {
+export function getCompiledDeserializer(
+	type: BcsType<unknown, unknown>,
+): CompiledDeserializer | null {
 	if (deserializerCache.has(type)) return deserializerCache.get(type)!;
 	const info = analyzeType(type);
-	if (!info) { deserializerCache.set(type, null); return null; }
+	if (!info) {
+		deserializerCache.set(type, null);
+		return null;
+	}
 
-	const fn: CompiledDeserializer = (data: Uint8Array) => {
-		const dv = new DataView(data.buffer, data.byteOffset, data.byteLength);
-		return deserializeValue(info, data, dv, 0).value;
-	};
+	_varCounter = 0;
+	const lines: string[] = [];
+	lines.push(
+		`var D=new DataView(d.buffer,d.byteOffset,d.byteLength);var o=0;`,
+	);
+	const resultId = genDeserialize(info, lines);
+	lines.push(`return ${resultId};`);
 
-	deserializerCache.set(type, fn);
-	return fn;
+	const body = lines.join("\n");
+	// eslint-disable-next-line @typescript-eslint/no-implied-eval
+	const fn = new Function("d", "E", body) as (
+		d: Uint8Array,
+		E: typeof _env,
+	) => unknown;
+	const deserializer: CompiledDeserializer = (data) => fn(data, _env);
+	deserializerCache.set(type, deserializer);
+	return deserializer;
 }
