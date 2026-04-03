@@ -27,7 +27,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 	#serialize: (
 		value: Input,
 		options?: BcsWriterOptions,
-	) => Uint8Array<ArrayBuffer>;
+	) => Uint8Array;
 	#compiledSerializer: CompiledSerializer | null | undefined = undefined;
 	#compiledSerializeInto: CompiledSerializeInto | null | undefined = undefined;
 	#compiledDeserializer: CompiledDeserializer | null | undefined = undefined;
@@ -41,7 +41,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 			serialize?: (
 				value: Input,
 				options?: BcsWriterOptions,
-			) => Uint8Array<ArrayBuffer>;
+			) => Uint8Array;
 			serializedSize?: (value: Input) => number | null;
 			validate?: (value: Input) => void;
 		} & BcsTypeOptions<T, Input, Name>,
@@ -56,7 +56,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 				// Compiled fast path — pre-analyzed type with direct buffer writes
 				if (!serializeOptions) {
 					if (this.#compiledSerializer === undefined) {
-						this.#compiledSerializer = getCompiledSerializer(this);
+						this.#compiledSerializer = getCompiledSerializer(this as any);
 					}
 					if (this.#compiledSerializer) {
 						return this.#compiledSerializer(value);
@@ -83,7 +83,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 		// Safe for non-transforms and option transforms (codegen handles null natively)
 		if (!options && (!this.#isTransformed || (this as any)._optionInner)) {
 			if (this.#compiledSerializer === undefined) {
-				this.#compiledSerializer = getCompiledSerializer(this);
+				this.#compiledSerializer = getCompiledSerializer(this as any);
 			}
 			if (this.#compiledSerializer) {
 				return new SerializedBcs(this, this.#compiledSerializer(value));
@@ -98,7 +98,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 	 */
 	serializeInto(value: Input, buffer: Uint8Array, offset = 0): number {
 		if (this.#compiledSerializeInto === undefined) {
-			this.#compiledSerializeInto = getCompiledSerializeInto(this);
+			this.#compiledSerializeInto = getCompiledSerializeInto(this as any);
 		}
 		if (this.#compiledSerializeInto) {
 			return this.#compiledSerializeInto(value, buffer, offset);
@@ -114,7 +114,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 		// but allow option transforms (codegen handles them natively)
 		if (!this.#isTransformed || (this as any)._optionInner) {
 			if (this.#compiledDeserializer === undefined) {
-				this.#compiledDeserializer = getCompiledDeserializer(this);
+				this.#compiledDeserializer = getCompiledDeserializer(this as any);
 			}
 			if (this.#compiledDeserializer) {
 				return this.#compiledDeserializer(bytes) as T;
@@ -155,7 +155,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 				this.#write(input ? input(value) : (value as never), writer),
 			serializedSize: (value) =>
 				this.serializedSize(input ? input(value) : (value as never)),
-			serialize: (value, options) =>
+			serialize: (value, options?) =>
 				innerSerialize(input ? input(value) : (value as never), options),
 			validate: (value) => {
 				validate?.(value);
@@ -179,13 +179,13 @@ export function isSerializedBcs(
 
 export class SerializedBcs<T, Input = T> {
 	#schema: BcsType<T, Input>;
-	#bytes: Uint8Array<ArrayBuffer>;
+	#bytes: Uint8Array;
 
 	get [SERIALIZED_BCS_BRAND]() {
 		return true;
 	}
 
-	constructor(schema: BcsType<T, Input>, bytes: Uint8Array<ArrayBuffer>) {
+	constructor(schema: BcsType<T, Input>, bytes: Uint8Array) {
 		this.#schema = schema;
 		this.#bytes = bytes;
 	}
@@ -295,7 +295,7 @@ export function dynamicSizeBcsType<
 }: {
 	name: Name;
 	read: (reader: BcsReader) => T;
-	serialize: (value: Input, options?: BcsWriterOptions) => Uint8Array<ArrayBuffer>;
+	serialize: (value: Input, options?: BcsWriterOptions) => Uint8Array;
 } & BcsTypeOptions<T, Input>) {
 	const type = new BcsType<T, Input>({
 		...options,
