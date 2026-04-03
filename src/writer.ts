@@ -127,7 +127,7 @@ export class BcsWriter {
 		const encoded = ulebEncode(value);
 		this.ensureSizeOrGrow(encoded.length);
 		for (let i = 0; i < encoded.length; i++) {
-			this.dataView.setUint8(this.bytePosition + i, encoded[i]);
+			this.dataView.setUint8(this.bytePosition + i, encoded[i]!);
 		}
 		return this.shift(encoded.length);
 	}

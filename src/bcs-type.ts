@@ -4,6 +4,8 @@ import { ulebEncode } from "./uleb.js";
 import type { BcsWriterOptions } from "./writer.js";
 import { BcsWriter } from "./writer.js";
 import type { EnumInputShape, EnumOutputShape, JoinString } from "./types.js";
+import { getCompiledSerializer, getCompiledDeserializer } from "./codegen.js";
+import type { CompiledSerializer, CompiledDeserializer } from "./codegen.js";
 
 export interface BcsTypeOptions<
 	T,
@@ -26,6 +28,9 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 		value: Input,
 		options?: BcsWriterOptions,
 	) => Uint8Array<ArrayBuffer>;
+	#compiledSerializer: CompiledSerializer | null | undefined = undefined;
+	#compiledDeserializer: CompiledDeserializer | null | undefined = undefined;
+	#isTransformed = false;
 
 	constructor(
 		options: {
@@ -46,10 +51,19 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 		this.#write = options.write;
 		this.#serialize =
 			options.serialize ??
-			((value, options) => {
+			((value, serializeOptions) => {
+				// Compiled fast path — pre-analyzed type with direct buffer writes
+				if (!serializeOptions) {
+					if (this.#compiledSerializer === undefined) {
+						this.#compiledSerializer = getCompiledSerializer(this);
+					}
+					if (this.#compiledSerializer) {
+						return this.#compiledSerializer(value);
+					}
+				}
 				const writer = new BcsWriter({
 					initialSize: this.serializedSize(value) ?? undefined,
-					...options,
+					...serializeOptions,
 				});
 				this.#write(value, writer);
 				return writer.toBytes();
@@ -68,6 +82,14 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 	}
 
 	parse(bytes: Uint8Array): T {
+		if (!this.#isTransformed) {
+			if (this.#compiledDeserializer === undefined) {
+				this.#compiledDeserializer = getCompiledDeserializer(this);
+			}
+			if (this.#compiledDeserializer) {
+				return this.#compiledDeserializer(bytes) as T;
+			}
+		}
 		const reader = new BcsReader(bytes);
 		return this.read(reader);
 	}
@@ -93,7 +115,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 		input?: (val: Input2) => Input;
 		output?: (value: T) => T2;
 	} & BcsTypeOptions<T2, Input2, NewName>) {
-		return new BcsType<T2, Input2, NewName>({
+		const transformed = new BcsType<T2, Input2, NewName>({
 			name: (name ?? this.name) as NewName,
 			read: (reader) =>
 				output ? output(this.read(reader)) : (this.read(reader) as never),
@@ -108,6 +130,8 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 				this.validate(input ? input(value) : (value as never));
 			},
 		});
+		transformed.#isTransformed = true;
+		return transformed;
 	}
 }
 
@@ -346,6 +370,7 @@ export class BcsStruct<
 	},
 	Name
 > {
+	_fields: [string, BcsType<any>][];
 	constructor({ name, fields, ...options }: BcsStructOptions<T, Name>) {
 		const canonicalOrder = Object.entries(fields);
 
@@ -382,6 +407,7 @@ export class BcsStruct<
 				}
 			},
 		});
+		this._fields = canonicalOrder;
 	}
 }
 
@@ -422,6 +448,7 @@ export class BcsEnum<
 	}>,
 	Name
 > {
+	_variants: [string, BcsType<any> | null][];
 	constructor({ fields, ...options }: BcsEnumOptions<T, Name>) {
 		const canonicalOrder = Object.entries(fields as object);
 		super({
@@ -443,12 +470,13 @@ export class BcsEnum<
 				} as never;
 			},
 			write: (value, writer) => {
-				const [name, val] = Object.entries(value).filter(([name]) =>
+				const entry = Object.entries(value).filter(([name]) =>
 					Object.hasOwn(fields, name),
-				)[0];
+				)[0]!;
+				const [name, val] = entry;
 
 				for (let i = 0; i < canonicalOrder.length; i++) {
-					const [optionName, optionType] = canonicalOrder[i];
+					const [optionName, optionType] = canonicalOrder[i]!;
 					if (optionName === name) {
 						writer.writeULEB(i);
 						optionType?.write(val, writer);
@@ -475,13 +503,14 @@ export class BcsEnum<
 					);
 				}
 
-				const [variant] = keys;
+				const variant = keys[0]!;
 
 				if (!Object.hasOwn(fields, variant)) {
 					throw new TypeError(`Invalid enum variant ${variant}`);
 				}
 			},
 		});
+		this._variants = canonicalOrder as [string, BcsType<any> | null][];
 	}
 }
 
@@ -527,7 +556,7 @@ export class BcsTuple<
 			serializedSize: (values) => {
 				let total = 0;
 				for (let i = 0; i < fields.length; i++) {
-					const size = fields[i].serializedSize(values[i]);
+					const size = fields[i]!.serializedSize(values[i]);
 					if (size == null) {
 						return null;
 					}
@@ -544,7 +573,7 @@ export class BcsTuple<
 			},
 			write: (value, writer) => {
 				for (let i = 0; i < fields.length; i++) {
-					fields[i].write(value[i], writer);
+					fields[i]!.write(value[i], writer);
 				}
 			},
 			...options,

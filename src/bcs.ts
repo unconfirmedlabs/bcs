@@ -54,7 +54,7 @@ function fixedArray<
 	Iterable<InferBcsInput<T>> & { length: number },
 	Name
 > {
-	return new BcsType<
+	const t = new BcsType<
 		InferBcsType<T>[],
 		Iterable<InferBcsInput<T>> & { length: number },
 		Name
@@ -85,6 +85,8 @@ function fixedArray<
 			}
 		},
 	});
+	(t as any)._elementType = type;
+	return t;
 }
 
 function option<T extends BcsType<any>>(
@@ -104,7 +106,7 @@ function option<T extends BcsType<any>>(
 	InferBcsInput<T> | null | undefined,
 	`Option<${T["name"]}>`
 > {
-	return bcs
+	const t = bcs
 		.enum(`Option<${type.name}>`, {
 			None: null,
 			Some: type,
@@ -123,6 +125,8 @@ function option<T extends BcsType<any>>(
 				return null;
 			},
 		});
+	(t as any)._optionInner = type;
+	return t;
 }
 
 function vector<
@@ -163,7 +167,7 @@ function vector<
 	Iterable<InferBcsInput<T>> & { length: number },
 	Name
 > {
-	return new BcsType<
+	const t = new BcsType<
 		InferBcsType<T>[],
 		Iterable<InferBcsInput<T>> & { length: number },
 		Name
@@ -191,12 +195,14 @@ function vector<
 			}
 		},
 	});
+	(t as any)._elementType = type;
+	return t;
 }
 
 export function compareBcsBytes(a: Uint8Array, b: Uint8Array): number {
 	for (let i = 0; i < Math.min(a.length, b.length); i++) {
 		if (a[i] !== b[i]) {
-			return a[i] - b[i];
+			return a[i]! - b[i]!;
 		}
 	}
 	return a.length - b.length;

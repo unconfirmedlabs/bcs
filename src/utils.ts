@@ -32,7 +32,7 @@ export function toBase64(data: Uint8Array): string {
 	}
 	let binary = "";
 	for (let i = 0; i < data.length; i++) {
-		binary += String.fromCharCode(data[i]);
+		binary += String.fromCharCode(data[i]!);
 	}
 	return btoa(binary);
 }
@@ -72,14 +72,14 @@ export function toBase58(data: Uint8Array): string {
 
 	let length = 0;
 	for (let i = zeros; i < data.length; i++) {
-		let carry = data[i];
+		let carry = data[i]!;
 		let j = 0;
 		for (
 			let it = b58.length - 1;
 			(carry !== 0 || j < length) && it >= 0;
 			it--, j++
 		) {
-			carry += 256 * b58[it];
+			carry += 256 * b58[it]!;
 			b58[it] = carry % 58;
 			carry = (carry / 58) | 0;
 		}
@@ -92,7 +92,7 @@ export function toBase58(data: Uint8Array): string {
 
 	let str = "1".repeat(zeros);
 	for (; it < b58.length; it++) {
-		str += BASE58_ALPHABET[b58[it]];
+		str += BASE58_ALPHABET[b58[it]!];
 	}
 	return str;
 }
@@ -109,7 +109,7 @@ export function fromBase58(str: string): Uint8Array {
 
 	let length = 0;
 	for (let i = zeros; i < str.length; i++) {
-		let carry = BASE58_MAP[str.charCodeAt(i)];
+		let carry = BASE58_MAP[str.charCodeAt(i)]!;
 		if (carry === 255) {
 			throw new Error(`Invalid base58 character: ${str[i]}`);
 		}
@@ -119,7 +119,7 @@ export function fromBase58(str: string): Uint8Array {
 			(carry !== 0 || j < length) && it >= 0;
 			it--, j++
 		) {
-			carry += 58 * b256[it];
+			carry += 58 * b256[it]!;
 			b256[it] = carry % 256;
 			carry = (carry / 256) | 0;
 		}

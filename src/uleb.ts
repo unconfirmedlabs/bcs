@@ -37,28 +37,37 @@ export function ulebDecode(arr: Uint8Array | number[]): {
 	value: number;
 	length: number;
 } {
-	let total = 0n;
-	let shift = 0n;
-	let len = 0;
+	if (arr.length === 0) {
+		throw new Error("ULEB decode error: buffer overflow");
+	}
 
-	while (true) {
-		if (len >= arr.length) {
-			throw new Error("ULEB decode error: buffer overflow");
-		}
+	// Fast path: single byte (value 0-127) — covers ~99% of BCS lengths
+	const b0 = arr[0]!;
+	if ((b0 & 0x80) === 0) return { value: b0, length: 1 };
 
+	// Multi-byte: use number ops for up to 4 bytes, then BigInt for larger
+	let total = b0 & 0x7f;
+	let shift = 7;
+	let len = 1;
+
+	while (len < arr.length) {
+		if (len >= 8) throw new Error("ULEB decode error: value too large");
 		const byte = arr[len]!;
-		len += 1;
-		total += BigInt(byte & 0x7f) << shift;
-
-		if ((byte & 0x80) === 0) {
-			break;
+		len++;
+		if (shift < 28) {
+			total |= (byte & 0x7f) << shift;
+		} else {
+			// For shifts >= 28, use multiplication to avoid 32-bit truncation
+			total += (byte & 0x7f) * (2 ** shift);
 		}
-		shift += 7n;
+		if ((byte & 0x80) === 0) {
+			if (total > Number.MAX_SAFE_INTEGER) {
+				throw new Error("ULEB decode error: value exceeds MAX_SAFE_INTEGER");
+			}
+			return { value: total, length: len };
+		}
+		shift += 7;
 	}
 
-	if (total > BigInt(Number.MAX_SAFE_INTEGER)) {
-		throw new Error("ULEB decode error: value exceeds MAX_SAFE_INTEGER");
-	}
-
-	return { value: Number(total), length: len };
+	throw new Error("ULEB decode error: buffer overflow");
 }

@@ -601,10 +601,10 @@ describe("lazy", () => {
 			children: Tree[];
 		};
 
-		const TreeType: BcsType<Tree, Tree> = bcs.struct("Tree", {
+		const TreeType: BcsType<Tree> = bcs.struct("Tree", {
 			value: bcs.u32(),
 			children: bcs.vector(bcs.lazy(() => TreeType)),
-		});
+		}) as any;
 
 		const tree: Tree = {
 			value: 1,
@@ -1011,6 +1011,6 @@ describe("sui patterns", () => {
 
 		const result = Command.parse(Command.serialize(cmd).toBytes());
 		expect(result.$kind).toBe("MoveCall");
-		expect(result.MoveCall.module).toBe("coin");
+		expect(result.MoveCall!.module).toBe("coin");
 	});
 });
