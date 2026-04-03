@@ -4,8 +4,8 @@ import { ulebEncode } from "./uleb.js";
 import type { BcsWriterOptions } from "./writer.js";
 import { BcsWriter } from "./writer.js";
 import type { EnumInputShape, EnumOutputShape, JoinString } from "./types.js";
-import { getCompiledSerializer, getCompiledDeserializer } from "./codegen.js";
-import type { CompiledSerializer, CompiledDeserializer } from "./codegen.js";
+import { getCompiledSerializer, getCompiledSerializeInto, getCompiledDeserializer } from "./codegen.js";
+import type { CompiledSerializer, CompiledSerializeInto, CompiledDeserializer } from "./codegen.js";
 
 export interface BcsTypeOptions<
 	T,
@@ -29,6 +29,7 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 		options?: BcsWriterOptions,
 	) => Uint8Array<ArrayBuffer>;
 	#compiledSerializer: CompiledSerializer | null | undefined = undefined;
+	#compiledSerializeInto: CompiledSerializeInto | null | undefined = undefined;
 	#compiledDeserializer: CompiledDeserializer | null | undefined = undefined;
 	#isTransformed = false;
 
@@ -79,6 +80,23 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 	serialize(value: Input, options?: BcsWriterOptions) {
 		this.validate(value);
 		return new SerializedBcs(this, this.#serialize(value, options));
+	}
+
+	/**
+	 * Serialize directly into a caller-provided buffer. Zero allocation.
+	 * Returns the new offset (position after the written bytes).
+	 */
+	serializeInto(value: Input, buffer: Uint8Array, offset = 0): number {
+		if (this.#compiledSerializeInto === undefined) {
+			this.#compiledSerializeInto = getCompiledSerializeInto(this);
+		}
+		if (this.#compiledSerializeInto) {
+			return this.#compiledSerializeInto(value, buffer, offset);
+		}
+		// Fallback: serialize to bytes and copy
+		const bytes = this.#serialize(value);
+		buffer.set(bytes, offset);
+		return offset + bytes.length;
 	}
 
 	parse(bytes: Uint8Array): T {
