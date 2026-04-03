@@ -53,15 +53,16 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 		this.#serialize =
 			options.serialize ??
 			((value, serializeOptions) => {
-				// Compiled fast path — pre-analyzed type with direct buffer writes
+				// First call: try to compile a fast serializer
 				if (!serializeOptions) {
-					if (this.#compiledSerializer === undefined) {
-						this.#compiledSerializer = getCompiledSerializer(this as any);
-					}
-					if (this.#compiledSerializer) {
-						return this.#compiledSerializer(value);
+					const compiled = getCompiledSerializer(this as any);
+					if (compiled) {
+						// Replace #serialize permanently — no more checks
+						this.#serialize = compiled as any;
+						return compiled(value);
 					}
 				}
+				// Fallback for uncompilable types
 				const writer = new BcsWriter({
 					initialSize: this.serializedSize(value) ?? undefined,
 					...serializeOptions,
@@ -79,8 +80,6 @@ export class BcsType<T, Input = T, const Name extends string = string> {
 
 	serialize(value: Input, options?: BcsWriterOptions) {
 		this.validate(value);
-		// Check compiled serializer at the top level
-		// Safe for non-transforms and option transforms (codegen handles null natively)
 		if (!options && (!this.#isTransformed || (this as any)._optionInner)) {
 			if (this.#compiledSerializer === undefined) {
 				this.#compiledSerializer = getCompiledSerializer(this as any);

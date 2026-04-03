@@ -340,11 +340,11 @@ function genDe(info: TypeInfo, L: string[]): string {
 			L.push(`var ${id}=(d[o]|d[o+1]<<8|d[o+2]<<16|d[o+3]<<24)>>>0;o+=4;`);
 			return id;
 		case "u64": {
-			// Read as two u32 from bytes, construct BigInt — avoids DataView
+			// Read as two u32, fast toString for small values (< 2^53)
 			const lo = nv();
 			const hi = nv();
 			L.push(`var ${lo}=(d[o]|d[o+1]<<8|d[o+2]<<16|d[o+3]<<24)>>>0,${hi}=(d[o+4]|d[o+5]<<8|d[o+6]<<16|d[o+7]<<24)>>>0;`);
-			L.push(`var ${id}=(BigInt(${hi})*0x100000000n+BigInt(${lo})).toString(10);o+=8;`);
+			L.push(`var ${id}=${hi}<0x200000?String(${hi}*0x100000000+${lo}):(BigInt(${hi})*0x100000000n+BigInt(${lo})).toString(10);o+=8;`);
 			return id;
 		}
 		case "u128": {
@@ -400,9 +400,8 @@ function genDe(info: TypeInfo, L: string[]): string {
 			L.push(
 				`var ${len}=0,_sh=0,_b;do{_b=d[o++];${len}|=(_b&0x7f)<<_sh;_sh+=7;}while(_b&0x80);`,
 			);
-			L.push(
-				`var ${id}=E.dec.decode(d.subarray(o,o+${len}));o+=${len};`,
-			);
+			// ASCII fast path: String.fromCharCode for short ASCII strings, TextDecoder fallback
+			L.push(`var ${id};if(${len}<128){var _a=1;for(var _j=0;_j<${len};_j++){if(d[o+_j]>127){_a=0;break}}if(_a){var _s='';for(var _j=0;_j<${len};_j++)_s+=String.fromCharCode(d[o+_j]);${id}=_s;}else{${id}=E.dec.decode(d.subarray(o,o+${len}));}}else{${id}=E.dec.decode(d.subarray(o,o+${len}));}o+=${len};`);
 			return id;
 		}
 		case "vector": {
